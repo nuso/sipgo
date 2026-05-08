@@ -129,7 +129,7 @@ func TestDialogServerRequestsWithinDialog(t *testing.T) {
 
 	t.Run("InvalidCseq", func(t *testing.T) {
 		// This covers issue explained as
-		// https://github.com/nuso/sipgo/issues/187
+		// https://github.com/emiago/sipgo/issues/187
 		conn := &sip.UDPConnection{
 			PacketConn: &fakes.UDPConn{
 				Writers: map[string]io.Writer{
@@ -154,7 +154,7 @@ func TestDialogServerRequestsWithinDialog(t *testing.T) {
 
 	t.Run("TerminateAfterSentRequest", func(t *testing.T) {
 		// This covers issue explained as
-		// https://github.com/nuso/sipgo/issues/187
+		// https://github.com/emiago/sipgo/issues/187
 		conn := &sip.UDPConnection{
 			PacketConn: &fakes.UDPConn{
 				Writers: map[string]io.Writer{
