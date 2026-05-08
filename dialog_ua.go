@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/emiago/sipgo/sip"
+	"github.com/nuso/sipgo/sip"
 	"github.com/google/uuid"
 )
 

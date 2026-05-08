@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"sync/atomic"
 
-	"github.com/emiago/sipgo/sip"
+	"github.com/nuso/sipgo/sip"
 )
 
 var (
