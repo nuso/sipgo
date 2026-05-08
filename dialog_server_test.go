@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/emiago/sipgo/fakes"
-	"github.com/emiago/sipgo/sip"
-	"github.com/emiago/sipgo/siptest"
+	"github.com/nuso/sipgo/fakes"
+	"github.com/nuso/sipgo/sip"
+	"github.com/nuso/sipgo/siptest"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -129,7 +129,7 @@ func TestDialogServerRequestsWithinDialog(t *testing.T) {
 
 	t.Run("InvalidCseq", func(t *testing.T) {
 		// This covers issue explained as
-		// https://github.com/emiago/sipgo/issues/187
+		// https://github.com/nuso/sipgo/issues/187
 		conn := &sip.UDPConnection{
 			PacketConn: &fakes.UDPConn{
 				Writers: map[string]io.Writer{
@@ -154,7 +154,7 @@ func TestDialogServerRequestsWithinDialog(t *testing.T) {
 
 	t.Run("TerminateAfterSentRequest", func(t *testing.T) {
 		// This covers issue explained as
-		// https://github.com/emiago/sipgo/issues/187
+		// https://github.com/nuso/sipgo/issues/187
 		conn := &sip.UDPConnection{
 			PacketConn: &fakes.UDPConn{
 				Writers: map[string]io.Writer{

@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/emiago/sipgo/sip"
+	"github.com/nuso/sipgo/sip"
 	"github.com/icholy/digest"
 )
 

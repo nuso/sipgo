@@ -19,9 +19,9 @@ import (
 	"time"
 
 	"github.com/arl/statsviz"
-	"github.com/emiago/sipgo/sip"
+	"github.com/nuso/sipgo/sip"
 
-	"github.com/emiago/sipgo"
+	"github.com/nuso/sipgo"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/rs/zerolog"
