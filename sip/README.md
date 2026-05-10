@@ -52,3 +52,10 @@ Behavior:
   bound while idle rather than an upper bound under sustained load.
 - Default (`ttl == 0`) preserves the pre-existing accumulate-until-exit
   behavior.
+
+### Monitoring pool cardinality
+
+`(*TransportLayer).UDPPoolSize()` returns the current number of entries in
+the UDP connection pool (listener self-entry + per-peer mappings + any
+client-dialed connections). Expose it as a gauge to keep eviction tuning
+observable.

@@ -332,6 +332,27 @@ func TestDefaultPeerSweepInterval(t *testing.T) {
 	}
 }
 
+// TestTransportLayer_UDPPoolSize covers the monitoring accessor: the size
+// tracks pool.Add calls, returns 0 before any UDP transport activity, and
+// composes with the eviction loop's mutations.
+func TestTransportLayer_UDPPoolSize(t *testing.T) {
+	tp := NewTransportLayer(net.DefaultResolver, NewParser(), nil)
+	t.Cleanup(func() { _ = tp.Close() })
+
+	require.Zero(t, tp.UDPPoolSize(), "fresh transport layer has no UDP pool entries")
+
+	listener := &UDPConnection{
+		PacketConn: newFakePacketConn(&net.UDPAddr{IP: net.IPv4zero, Port: 5060}),
+		PacketAddr: "0.0.0.0:5060",
+		Listener:   true,
+	}
+	tp.udp.pool.Add(listener.PacketAddr, listener)
+	tp.udp.pool.Add(peerAddr(45001).String(), listener)
+	tp.udp.pool.Add(peerAddr(45002).String(), listener)
+
+	require.Equal(t, 3, tp.UDPPoolSize(), "size reflects pool.Add calls")
+}
+
 // TestNewTransportLayer_PropagatesUDPPeerIdleTTL pins the option wiring so a
 // future refactor of NewTransportLayer cannot silently drop the TTL.
 func TestNewTransportLayer_PropagatesUDPPeerIdleTTL(t *testing.T) {

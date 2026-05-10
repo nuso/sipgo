@@ -309,6 +309,20 @@ func (l *TransportLayer) ServeWSS(c net.Listener) error {
 	return l.wss.Serve(c, l.handleMessage)
 }
 
+// UDPPoolSize returns the current number of entries in the UDP transport's
+// connection pool. This includes the listener self-entry plus one mapping
+// per distinct inbound peer source address (and any client-dialed UDP
+// connections held by the pool).
+//
+// Intended for monitoring callers running a long-lived UDP listener with
+// WithTransportLayerUDPPeerIdleTTL, where cardinality is otherwise opaque.
+func (l *TransportLayer) UDPPoolSize() int {
+	if l.udp == nil || l.udp.pool == nil {
+		return 0
+	}
+	return l.udp.pool.Size()
+}
+
 func (l *TransportLayer) addListenPort(network string, port int) {
 	l.listenPortsMu.Lock()
 	defer l.listenPortsMu.Unlock()
