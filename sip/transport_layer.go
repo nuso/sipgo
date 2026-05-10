@@ -108,9 +108,26 @@ func WithTransportLayerTransports(conf TransportsConfig) TransportLayerOption {
 // preserve the unbounded-accumulation behavior expected by short-lived listeners.
 //
 // Enable this when a UDP listener is long-lived and exposed to untrusted
-// sources to bound the per-peer map against source-port churn. Conservative
-// in-flight protection skips a sweep pass entirely when the shared listener
-// connection has an elevated reference count (a transaction is using it).
+// sources to bound the per-peer map against source-port churn.
+//
+// In-flight protection: a sweep pass is skipped entirely when the shared
+// listener connection has a refcount above its baseline of 1 (meaning a
+// transaction is currently using the listener via pool.Get/Ref). This is
+// intentionally coarse — for UDP listeners every per-peer pool entry points
+// at the same underlying connection, so per-entry refcounting is not
+// available. Practical consequences:
+//
+//   - Under light traffic the TTL acts as a hard cap on how long idle peer
+//     entries linger.
+//   - Under sustained traffic the sweep effectively never runs and the TTL
+//     becomes a "lower bound while idle" rather than an upper bound under
+//     load. Idle peers will be reaped during the next quiet interval.
+//
+// If a stronger guarantee is needed under load (e.g. adversarial source-port
+// churn during a sustained transaction stream), a follow-up enhancement
+// would track per-peer refcounts separately from the listener refcount; the
+// current option is the conservative shape that does not change response-
+// correlation semantics.
 func WithTransportLayerUDPPeerIdleTTL(ttl time.Duration) TransportLayerOption {
 	return func(l *TransportLayer) {
 		l.udpPeerIdleTTL = ttl

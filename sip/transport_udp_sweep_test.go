@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -348,4 +349,147 @@ func TestNewTransportLayer_PropagatesUDPPeerIdleTTL(t *testing.T) {
 	})
 	require.Equal(t, ttl, tp.udp.peerIdleTTL)
 	require.Equal(t, defaultPeerSweepInterval(ttl), tp.udp.peerSweepInterval)
+}
+
+// TestSweepStalePeers_TTLBoundary pins the strict Before semantics of
+// collectStale: an entry whose lastSeen is exactly at the cutoff is NOT
+// evicted; one nanosecond older is.
+func TestSweepStalePeers_TTLBoundary(t *testing.T) {
+	t0 := time.Date(2026, 5, 11, 12, 0, 0, 0, time.UTC)
+	ttl := 30 * time.Second
+
+	tr := &TransportUDP{peerIdleTTL: ttl, nowFn: func() time.Time { return t0 }}
+	tr.init(NewParser())
+
+	listener := &UDPConnection{
+		PacketConn: newFakePacketConn(&net.UDPAddr{IP: net.IPv4zero, Port: 5060}),
+		PacketAddr: "0.0.0.0:5060",
+		Listener:   true,
+	}
+	listener.Ref(1)
+
+	peers := newPeerLastSeen()
+	atCutoff := peerAddr(41001).String()
+	pastCutoff := peerAddr(41002).String()
+	peers.touch(atCutoff, t0)
+	peers.touch(pastCutoff, t0.Add(-time.Nanosecond))
+	tr.pool.Add(atCutoff, listener)
+	tr.pool.Add(pastCutoff, listener)
+
+	// "now" sits exactly TTL after t0, so cutoff == t0. atCutoff.lastSeen ==
+	// cutoff → Before(cutoff) is false → not stale. pastCutoff is 1ns earlier
+	// → stale.
+	now := t0.Add(ttl)
+	evicted := tr.sweepStalePeers(now, ttl, peers, listener)
+	require.Equal(t, 1, evicted)
+
+	assert.NotNil(t, tr.pool.getUnref(atCutoff), "entry exactly at cutoff is retained (strict Before)")
+	assert.Nil(t, tr.pool.getUnref(pastCutoff), "entry one nanosecond older is evicted")
+}
+
+// TestReadListenerConnection_ReAddsEvictedPeer is the end-to-end proof for
+// the firstSeen-after-eviction code path: after the sweep drops a peer
+// entry, the next packet from that same peer must reinstate the pool
+// mapping so response-correlation does not break.
+func TestReadListenerConnection_ReAddsEvictedPeer(t *testing.T) {
+	clk := newFakeClock(time.Date(2026, 5, 11, 0, 0, 0, 0, time.UTC))
+	tr := &TransportUDP{
+		peerIdleTTL:       50 * time.Millisecond,
+		peerSweepInterval: 10 * time.Millisecond,
+		nowFn:             clk.Now,
+	}
+	tr.init(NewParser())
+
+	pc := newFakePacketConn(&net.UDPAddr{IP: net.IPv4zero, Port: 5060})
+	listener := &UDPConnection{
+		PacketConn: pc,
+		PacketAddr: pc.LocalAddr().String(),
+		Listener:   true,
+	}
+	tr.pool.Add(listener.PacketAddr, listener)
+
+	var delivered atomic.Int32
+	handler := func(_ Message) { delivered.Add(1) }
+
+	done := make(chan struct{})
+	go func() {
+		tr.readListenerConnection(listener, listener.PacketAddr, handler)
+		close(done)
+	}()
+	t.Cleanup(func() {
+		_ = pc.Close()
+		<-done
+	})
+
+	peer := peerAddr(51234)
+	payload := []byte(sweepTestOptionsPacket)
+
+	// First packet establishes the per-peer pool entry.
+	pc.send(payload, peer)
+	require.Eventually(t, func() bool { return delivered.Load() == 1 }, time.Second, 5*time.Millisecond)
+	require.NotNil(t, tr.pool.getUnref(peer.String()), "peer registered on first packet")
+
+	// Advance fake clock past the TTL; sweep must drop the entry.
+	clk.Advance(500 * time.Millisecond)
+	require.Eventually(t, func() bool {
+		return tr.pool.getUnref(peer.String()) == nil
+	}, 2*time.Second, 5*time.Millisecond, "sweep should evict idle peer")
+
+	// Second packet from the same peer must reinstate the pool entry
+	// regardless of lastRaddr still naming this peer.
+	pc.send(payload, peer)
+	require.Eventually(t, func() bool { return delivered.Load() == 2 }, time.Second, 5*time.Millisecond)
+	require.NotNil(t, tr.pool.getUnref(peer.String()), "peer re-registered after eviction round trip")
+}
+
+// TestReadListenerConnection_SweepGoroutineExits verifies that closing the
+// listener tears down the sweep goroutine as well — a leak here would
+// accumulate one goroutine per Serve invocation over the process lifetime.
+func TestReadListenerConnection_SweepGoroutineExits(t *testing.T) {
+	clk := newFakeClock(time.Date(2026, 5, 11, 0, 0, 0, 0, time.UTC))
+	tr := &TransportUDP{
+		peerIdleTTL:       30 * time.Second,
+		peerSweepInterval: 5 * time.Millisecond,
+		nowFn:             clk.Now,
+	}
+	tr.init(NewParser())
+
+	pc := newFakePacketConn(&net.UDPAddr{IP: net.IPv4zero, Port: 5060})
+	listener := &UDPConnection{
+		PacketConn: pc,
+		PacketAddr: pc.LocalAddr().String(),
+		Listener:   true,
+	}
+	tr.pool.Add(listener.PacketAddr, listener)
+
+	baseline := runtime.NumGoroutine()
+
+	done := make(chan struct{})
+	go func() {
+		tr.readListenerConnection(listener, listener.PacketAddr, func(Message) {})
+		close(done)
+	}()
+
+	// Confirm the read loop + sweep goroutine are actually running.
+	require.Eventually(t, func() bool {
+		return runtime.NumGoroutine() >= baseline+2
+	}, time.Second, 5*time.Millisecond, "read + sweep goroutines should be running")
+
+	// Inject a packet so the sweep ticker has fired at least once with a
+	// non-empty peers map. Not strictly required to prove shutdown, but
+	// matches realistic usage and lets the ticker exercise its select.
+	pc.send([]byte(sweepTestOptionsPacket), peerAddr(52000))
+	time.Sleep(20 * time.Millisecond)
+
+	require.NoError(t, pc.Close())
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("read loop did not exit")
+	}
+
+	// Give the sweep goroutine a moment to observe the closed done channel.
+	require.Eventually(t, func() bool {
+		return runtime.NumGoroutine() <= baseline+1 // allow one stragglar from test runtime
+	}, time.Second, 5*time.Millisecond, "sweep goroutine must exit when listener exits")
 }
