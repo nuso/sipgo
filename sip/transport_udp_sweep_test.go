@@ -442,6 +442,81 @@ func TestReadListenerConnection_ReAddsEvictedPeer(t *testing.T) {
 	require.NotNil(t, tr.pool.getUnref(peer.String()), "peer re-registered after eviction round trip")
 }
 
+// TestPeerLastSeen_ConcurrentTouchAndSweep stresses peerLastSeen + sweep
+// from many goroutines under -race. The sweep ticker fires concurrently
+// with touch() bursts and direct sweepStalePeers calls; the test passes if
+// the race detector stays quiet, the sweep never panics on a mutated map,
+// and the map converges to "all stale evicted" once the stress ends.
+func TestPeerLastSeen_ConcurrentTouchAndSweep(t *testing.T) {
+	const (
+		writers          = 16
+		touchesPerWriter = 200
+		distinctPeers    = 64
+		ttl              = 5 * time.Millisecond
+	)
+
+	tr := &TransportUDP{peerIdleTTL: ttl, nowFn: time.Now}
+	tr.init(NewParser())
+
+	listener := &UDPConnection{
+		PacketConn: newFakePacketConn(&net.UDPAddr{IP: net.IPv4zero, Port: 5060}),
+		PacketAddr: "0.0.0.0:5060",
+		Listener:   true,
+	}
+	listener.Ref(1)
+
+	peers := newPeerLastSeen()
+	stop := make(chan struct{})
+
+	// Background sweeper running roughly every 100µs against the live peers
+	// map. This is more aggressive than the production ticker but matches
+	// the test goal: maximize the chance of catching a touch/collect race.
+	sweepDone := make(chan struct{})
+	go func() {
+		defer close(sweepDone)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				tr.sweepStalePeers(time.Now(), ttl, peers, listener)
+				time.Sleep(100 * time.Microsecond)
+			}
+		}
+	}()
+
+	// Concurrent writers touch a rotating set of peers and intermittently
+	// register them in the pool, mirroring readListenerConnection's per-
+	// packet path. Reuse the listener as the pool value as the live read
+	// loop does.
+	var writersWG sync.WaitGroup
+	writersWG.Add(writers)
+	for w := 0; w < writers; w++ {
+		w := w
+		go func() {
+			defer writersWG.Done()
+			for i := 0; i < touchesPerWriter; i++ {
+				addr := peerAddr(60000 + ((w*touchesPerWriter + i) % distinctPeers)).String()
+				if peers.touch(addr, time.Now()) {
+					tr.pool.Add(addr, listener)
+				}
+			}
+		}()
+	}
+	writersWG.Wait()
+
+	close(stop)
+	<-sweepDone
+
+	// After the writers stop touching, every peer entry ages past TTL on the
+	// next tick. Final convergence sweep drains the map.
+	require.Eventually(t, func() bool {
+		time.Sleep(ttl + 2*time.Millisecond) // age remaining entries
+		tr.sweepStalePeers(time.Now(), ttl, peers, listener)
+		return peers.size() == 0
+	}, time.Second, 5*time.Millisecond, "peers map should converge to empty after stress ends")
+}
+
 // TestReadListenerConnection_SweepGoroutineExits verifies that closing the
 // listener tears down the sweep goroutine as well — a leak here would
 // accumulate one goroutine per Serve invocation over the process lifetime.
