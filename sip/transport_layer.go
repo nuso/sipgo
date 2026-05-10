@@ -44,6 +44,10 @@ type TransportLayer struct {
 	// dnsPreferSRV does always SRV lookup first
 	dnsPreferSRV bool
 	dnsPreferIP  int // 0 - no preference , 1 -ip4, 2 - ip6
+
+	// udpPeerIdleTTL, when > 0, enables periodic eviction of UDP listener
+	// per-peer pool entries idle past this duration. 0 means disabled.
+	udpPeerIdleTTL time.Duration
 }
 
 type TransportLayerOption func(l *TransportLayer)
@@ -98,6 +102,21 @@ func WithTransportLayerTransports(conf TransportsConfig) TransportLayerOption {
 	}
 }
 
+// WithTransportLayerUDPPeerIdleTTL enables periodic eviction of UDP listener
+// per-peer pool entries (one per distinct inbound source address) whose last
+// seen packet is older than ttl. Pass 0 (the default) to disable eviction and
+// preserve the unbounded-accumulation behavior expected by short-lived listeners.
+//
+// Enable this when a UDP listener is long-lived and exposed to untrusted
+// sources to bound the per-peer map against source-port churn. Conservative
+// in-flight protection skips a sweep pass entirely when the shared listener
+// connection has an elevated reference count (a transaction is using it).
+func WithTransportLayerUDPPeerIdleTTL(ttl time.Duration) TransportLayerOption {
+	return func(l *TransportLayer) {
+		l.udpPeerIdleTTL = ttl
+	}
+}
+
 // NewLayer creates transport layer.
 // dns Resolver
 // sip parser
@@ -130,6 +149,7 @@ func NewTransportLayer(
 		UDP: &TransportUDP{
 			log:             l.log.With("caller", "Transport<UDP>"),
 			connectionReuse: l.connectionReuse,
+			peerIdleTTL:     l.udpPeerIdleTTL,
 		},
 		TCP: &TransportTCP{
 			log:             l.log.With("caller", "Transport<TCP>"),

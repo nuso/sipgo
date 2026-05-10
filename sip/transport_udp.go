@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"sync"
+	"time"
 )
 
 var (
@@ -23,6 +24,20 @@ type TransportUDP struct {
 	pool            *connectionPool
 	log             *slog.Logger
 	connectionReuse bool
+
+	// peerIdleTTL, when > 0, enables periodic eviction of pool entries for
+	// listener peer source addresses idle for more than this duration. The
+	// zero value disables eviction (pre-BRI-15 behavior).
+	peerIdleTTL time.Duration
+
+	// peerSweepInterval is the cadence at which the eviction goroutine runs
+	// when peerIdleTTL > 0. Derived from peerIdleTTL by init when unset.
+	// Exported only via package-internal test wiring.
+	peerSweepInterval time.Duration
+
+	// nowFn returns the current time. Defaults to time.Now in init; tests
+	// may override before init runs to drive the sweep deterministically.
+	nowFn func() time.Time
 }
 
 func (t *TransportUDP) init(par *Parser) {
@@ -30,6 +45,131 @@ func (t *TransportUDP) init(par *Parser) {
 	t.pool = newConnectionPool()
 	if t.log == nil {
 		t.log = DefaultLogger()
+	}
+	if t.nowFn == nil {
+		t.nowFn = time.Now
+	}
+	if t.peerIdleTTL > 0 && t.peerSweepInterval == 0 {
+		t.peerSweepInterval = defaultPeerSweepInterval(t.peerIdleTTL)
+	}
+}
+
+// defaultPeerSweepInterval picks a reasonable sweep cadence for a given TTL,
+// clamped to a 1s floor (avoid hot-spinning on micro-TTLs) and 60s ceiling
+// (responsiveness on multi-hour TTLs).
+func defaultPeerSweepInterval(ttl time.Duration) time.Duration {
+	interval := ttl / 4
+	if interval > 60*time.Second {
+		interval = 60 * time.Second
+	}
+	if interval < time.Second {
+		interval = time.Second
+	}
+	return interval
+}
+
+// peerLastSeen tracks the wall time of the most recently observed packet from
+// each peer source address on a single UDP listener. It is the eviction-loop
+// view of the read loop's acceptedAddr map.
+type peerLastSeen struct {
+	mu sync.Mutex
+	m  map[string]time.Time
+}
+
+func newPeerLastSeen() *peerLastSeen {
+	return &peerLastSeen{m: make(map[string]time.Time)}
+}
+
+// touch records a packet from addr at the given time. Returns true if this is
+// the first time we have seen addr (i.e. caller should re-Add to the pool).
+func (p *peerLastSeen) touch(addr string, now time.Time) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	_, existed := p.m[addr]
+	p.m[addr] = now
+	return !existed
+}
+
+// collectStale returns the addresses whose lastSeen is older than now-ttl.
+func (p *peerLastSeen) collectStale(now time.Time, ttl time.Duration) []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if ttl <= 0 {
+		return nil
+	}
+	cutoff := now.Add(-ttl)
+	var stale []string
+	for addr, lastSeen := range p.m {
+		if lastSeen.Before(cutoff) {
+			stale = append(stale, addr)
+		}
+	}
+	return stale
+}
+
+func (p *peerLastSeen) delete(addrs []string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, a := range addrs {
+		delete(p.m, a)
+	}
+}
+
+func (p *peerLastSeen) snapshot() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make([]string, 0, len(p.m))
+	for a := range p.m {
+		out = append(out, a)
+	}
+	return out
+}
+
+func (p *peerLastSeen) size() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.m)
+}
+
+// sweepStalePeers evicts peer pool entries idle past ttl. A non-baseline
+// reference count on the shared listener connection (Ref(0) > 1) means a
+// transaction is referencing the listener; in that case we skip the entire
+// pass rather than risk evicting a peer entry that is about to be looked up
+// for response correlation. ttl <= 0 disables the pass.
+func (t *TransportUDP) sweepStalePeers(now time.Time, ttl time.Duration, peers *peerLastSeen, listener *UDPConnection) int {
+	if ttl <= 0 {
+		return 0
+	}
+	if listener != nil && listener.Ref(0) > 1 {
+		return 0
+	}
+	stale := peers.collectStale(now, ttl)
+	if len(stale) == 0 {
+		return 0
+	}
+	t.pool.DeleteMultiple(stale)
+	peers.delete(stale)
+	return len(stale)
+}
+
+// runPeerSweepLoop is the eviction goroutine launched by readListenerConnection
+// when peerIdleTTL > 0. It exits when done is closed (the read loop returning).
+func (t *TransportUDP) runPeerSweepLoop(done <-chan struct{}, peers *peerLastSeen, listener *UDPConnection, laddr string) {
+	interval := t.peerSweepInterval
+	if interval <= 0 {
+		interval = defaultPeerSweepInterval(t.peerIdleTTL)
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-done:
+			return
+		case <-ticker.C:
+			if n := t.sweepStalePeers(t.nowFn(), t.peerIdleTTL, peers, listener); n > 0 {
+				t.log.Debug("UDP listener evicted idle peers", "laddr", laddr, "count", n)
+			}
+		}
 	}
 }
 
@@ -122,25 +262,28 @@ func (t *TransportUDP) readUDPConnection(conn *UDPConnection, raddr string, ladd
 
 func (t *TransportUDP) readListenerConnection(conn *UDPConnection, laddr string, handler MessageHandler) {
 	buf := make([]byte, TransportBufferReadSize)
+	// peers tracks per-peer lastSeen so the optional eviction loop can
+	// evict idle entries. With peerIdleTTL == 0 the map only grows as
+	// before; the deferred cleanup wipes it on listener exit.
+	peers := newPeerLastSeen()
+
 	defer func() {
 		if err := t.pool.CloseAndDelete(conn, laddr); err != nil {
 			t.log.Warn("connection pool not clean cleanup", "error", err)
 		}
 	}()
 	defer t.log.Debug("Read listener connection stopped", "laddr", laddr)
-
-	var lastRaddr string
-	// NOTE: consider to refactor, but for cleanup
-	// We are reusing UDP listener as dial connection
-	acceptedAddr := make(map[string]struct{})
 	defer func() {
-		addrs := make([]string, 0, len(acceptedAddr))
-		for addr := range acceptedAddr {
-			addrs = append(addrs, addr)
-		}
-		t.pool.DeleteMultiple(addrs)
+		t.pool.DeleteMultiple(peers.snapshot())
 	}()
 
+	if t.peerIdleTTL > 0 {
+		done := make(chan struct{})
+		defer close(done)
+		go t.runPeerSweepLoop(done, peers, conn, laddr)
+	}
+
+	var lastRaddr string
 	for {
 		num, raddr, err := conn.ReadFrom(buf)
 		if err != nil {
@@ -157,11 +300,14 @@ func (t *TransportUDP) readListenerConnection(conn *UDPConnection, laddr string,
 			continue
 		}
 		rastr := raddr.String()
-		if lastRaddr != rastr {
+		// Update lastSeen on every packet so the sweep can recognize active peers.
+		// firstSeen also catches the case where a previously-known peer was just
+		// evicted by the sweep and needs its pool mapping reinstated.
+		firstSeen := peers.touch(rastr, t.nowFn())
+		if firstSeen || lastRaddr != rastr {
 			// In most cases we are in single connection mode so no need to keep adding in pool
 			// In case of server and multiple UDP listeners, this makes sure right one is used
 			t.pool.Add(rastr, conn)
-			acceptedAddr[rastr] = struct{}{}
 		}
 
 		t.parseAndHandle(data, rastr, handler)
