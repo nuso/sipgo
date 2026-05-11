@@ -44,6 +44,10 @@ type TransportLayer struct {
 	// dnsPreferSRV does always SRV lookup first
 	dnsPreferSRV bool
 	dnsPreferIP  int // 0 - no preference , 1 -ip4, 2 - ip6
+
+	// udpPeerIdleTTL, when > 0, enables periodic eviction of UDP listener
+	// per-peer pool entries idle past this duration. 0 means disabled.
+	udpPeerIdleTTL time.Duration
 }
 
 type TransportLayerOption func(l *TransportLayer)
@@ -98,6 +102,38 @@ func WithTransportLayerTransports(conf TransportsConfig) TransportLayerOption {
 	}
 }
 
+// WithTransportLayerUDPPeerIdleTTL enables periodic eviction of UDP listener
+// per-peer pool entries (one per distinct inbound source address) whose last
+// seen packet is older than ttl. Pass 0 (the default) to disable eviction and
+// preserve the unbounded-accumulation behavior expected by short-lived listeners.
+//
+// Enable this when a UDP listener is long-lived and exposed to untrusted
+// sources to bound the per-peer map against source-port churn.
+//
+// In-flight protection: a sweep pass is skipped entirely when the shared
+// listener connection has a refcount above its baseline of 1 (meaning a
+// transaction is currently using the listener via pool.Get/Ref). This is
+// intentionally coarse — for UDP listeners every per-peer pool entry points
+// at the same underlying connection, so per-entry refcounting is not
+// available. Practical consequences:
+//
+//   - Under light traffic the TTL acts as a hard cap on how long idle peer
+//     entries linger.
+//   - Under sustained traffic the sweep effectively never runs and the TTL
+//     becomes a "lower bound while idle" rather than an upper bound under
+//     load. Idle peers will be reaped during the next quiet interval.
+//
+// If a stronger guarantee is needed under load (e.g. adversarial source-port
+// churn during a sustained transaction stream), a follow-up enhancement
+// would track per-peer refcounts separately from the listener refcount; the
+// current option is the conservative shape that does not change response-
+// correlation semantics.
+func WithTransportLayerUDPPeerIdleTTL(ttl time.Duration) TransportLayerOption {
+	return func(l *TransportLayer) {
+		l.udpPeerIdleTTL = ttl
+	}
+}
+
 // NewLayer creates transport layer.
 // dns Resolver
 // sip parser
@@ -130,6 +166,7 @@ func NewTransportLayer(
 		UDP: &TransportUDP{
 			log:             l.log.With("caller", "Transport<UDP>"),
 			connectionReuse: l.connectionReuse,
+			peerIdleTTL:     l.udpPeerIdleTTL,
 		},
 		TCP: &TransportTCP{
 			log:             l.log.With("caller", "Transport<TCP>"),
@@ -270,6 +307,20 @@ func (l *TransportLayer) ServeWSS(c net.Listener) error {
 	l.addListenPort("wss", port)
 
 	return l.wss.Serve(c, l.handleMessage)
+}
+
+// UDPPoolSize returns the current number of entries in the UDP transport's
+// connection pool. This includes the listener self-entry plus one mapping
+// per distinct inbound peer source address (and any client-dialed UDP
+// connections held by the pool).
+//
+// Intended for monitoring callers running a long-lived UDP listener with
+// WithTransportLayerUDPPeerIdleTTL, where cardinality is otherwise opaque.
+func (l *TransportLayer) UDPPoolSize() int {
+	if l.udp == nil || l.udp.pool == nil {
+		return 0
+	}
+	return l.udp.pool.Size()
 }
 
 func (l *TransportLayer) addListenPort(network string, port int) {
