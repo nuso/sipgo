@@ -373,7 +373,7 @@ func TestNewTransportLayer_PropagatesUDPPeerIdleTTL(t *testing.T) {
 }
 
 // TestSweepStalePeers_TTLBoundary pins the strict Before semantics of
-// collectStale: an entry whose lastSeen is exactly at the cutoff is NOT
+// evictStale: an entry whose lastSeen is exactly at the cutoff is NOT
 // evicted; one nanosecond older is.
 func TestSweepStalePeers_TTLBoundary(t *testing.T) {
 	t0 := time.Date(2026, 5, 11, 12, 0, 0, 0, time.UTC)
@@ -588,4 +588,67 @@ func TestReadListenerConnection_SweepGoroutineExits(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return runtime.NumGoroutine() <= baseline+1 // allow one stragglar from test runtime
 	}, time.Second, 5*time.Millisecond, "sweep goroutine must exit when listener exits")
+}
+
+// TestPeerLastSeen_EvictStaleSerializesWithTouch is the regression test for
+// the sweep race where the prior collectStale + (released-lock) +
+// pool.DeleteMultiple + peers.delete sequence let a concurrent touch
+// observe an inconsistent state: peers.m still listed an address whose
+// pool entry had just been deleted, so the read loop's firstSeen check
+// returned false and skipped re-Adding the peer to the pool — breaking
+// response routing the next time the listener was asked for that peer's
+// connection.
+//
+// evictStale now holds p.mu across the deleter callback, so any
+// concurrent touch on the address being deleted blocks until the deleter
+// returns AND p.m has been updated. Post-eviction, the next touch returns
+// firstSeen=true and the caller re-Adds the pool entry atomically with
+// the lastSeen reinstatement.
+func TestPeerLastSeen_EvictStaleSerializesWithTouch(t *testing.T) {
+	t0 := time.Date(2026, 5, 11, 12, 0, 0, 0, time.UTC)
+	ttl := 30 * time.Second
+
+	peers := newPeerLastSeen()
+	addr := "10.0.0.1:5060"
+	peers.touch(addr, t0)
+
+	deleterStart := make(chan struct{})
+	deleterReturn := make(chan struct{})
+	deleter := func(stale []string) {
+		require.Equal(t, []string{addr}, stale, "deleter should receive the single stale entry")
+		close(deleterStart)
+		<-deleterReturn
+	}
+
+	evictResult := make(chan int, 1)
+	go func() {
+		evictResult <- peers.evictStale(t0.Add(2*ttl), ttl, deleter)
+	}()
+
+	<-deleterStart
+
+	touchStart := make(chan struct{})
+	touchResult := make(chan bool, 1)
+	go func() {
+		close(touchStart)
+		touchResult <- peers.touch(addr, t0.Add(3*ttl))
+	}()
+	<-touchStart
+
+	select {
+	case fs := <-touchResult:
+		t.Fatalf("touch must block on peers.mu while evictStale's deleter runs; got firstSeen=%v", fs)
+	case <-time.After(50 * time.Millisecond):
+		// Expected: touch is blocked behind evictStale's lock.
+	}
+
+	close(deleterReturn)
+	require.Equal(t, 1, <-evictResult, "evictStale reports one entry evicted")
+
+	select {
+	case fs := <-touchResult:
+		require.True(t, fs, "after eviction completes, touch on the same address must see firstSeen=true so the caller re-Adds the pool entry")
+	case <-time.After(time.Second):
+		t.Fatal("touch did not unblock after evictStale returned")
+	}
 }

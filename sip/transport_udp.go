@@ -90,12 +90,18 @@ func (p *peerLastSeen) touch(addr string, now time.Time) bool {
 	return !existed
 }
 
-// collectStale returns the addresses whose lastSeen is older than now-ttl.
-func (p *peerLastSeen) collectStale(now time.Time, ttl time.Duration) []string {
+// evictStale collects addresses whose lastSeen is older than now-ttl,
+// invokes deleter under p.mu, then removes them from p.m. Holding p.mu
+// across the deleter callback serializes the entire eviction with any
+// concurrent touch(): a packet that arrives mid-sweep blocks until both
+// the deleter and the map removal complete, so callers never observe an
+// intermediate state where p.m still has an address whose external state
+// (e.g. connection pool entry) has already been deleted.
+func (p *peerLastSeen) evictStale(now time.Time, ttl time.Duration, deleter func([]string)) int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if ttl <= 0 {
-		return nil
+		return 0
 	}
 	cutoff := now.Add(-ttl)
 	var stale []string
@@ -104,15 +110,16 @@ func (p *peerLastSeen) collectStale(now time.Time, ttl time.Duration) []string {
 			stale = append(stale, addr)
 		}
 	}
-	return stale
-}
-
-func (p *peerLastSeen) delete(addrs []string) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	for _, a := range addrs {
+	if len(stale) == 0 {
+		return 0
+	}
+	if deleter != nil {
+		deleter(stale)
+	}
+	for _, a := range stale {
 		delete(p.m, a)
 	}
+	return len(stale)
 }
 
 func (p *peerLastSeen) snapshot() []string {
@@ -136,6 +143,11 @@ func (p *peerLastSeen) size() int {
 // transaction is referencing the listener; in that case we skip the entire
 // pass rather than risk evicting a peer entry that is about to be looked up
 // for response correlation. ttl <= 0 disables the pass.
+//
+// The pool.DeleteMultiple call runs under peers.mu via evictStale so a
+// packet that arrives mid-sweep blocks in touch() until both maps are
+// consistent — the next touch() then observes firstSeen=true and re-Adds
+// the pool entry, preserving response-correlation routing.
 func (t *TransportUDP) sweepStalePeers(now time.Time, ttl time.Duration, peers *peerLastSeen, listener *UDPConnection) int {
 	if ttl <= 0 {
 		return 0
@@ -143,13 +155,7 @@ func (t *TransportUDP) sweepStalePeers(now time.Time, ttl time.Duration, peers *
 	if listener != nil && listener.Ref(0) > 1 {
 		return 0
 	}
-	stale := peers.collectStale(now, ttl)
-	if len(stale) == 0 {
-		return 0
-	}
-	t.pool.DeleteMultiple(stale)
-	peers.delete(stale)
-	return len(stale)
+	return peers.evictStale(now, ttl, t.pool.DeleteMultiple)
 }
 
 // runPeerSweepLoop is the eviction goroutine launched by readListenerConnection
